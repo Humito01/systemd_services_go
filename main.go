@@ -1,194 +1,218 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/coreos/go-systemd/v22/dbus"
-	ui "github.com/gizak/termui/v3"
-	"github.com/gizak/termui/v3/widgets"
 )
 
-var currentSelected int
-var currentPage int
-
-const servicesPerPage = 10
-
-var services []dbus.UnitStatus
-var filteredServices []dbus.UnitStatus
-var searchQuery string
+type Model struct {
+	Services         []dbus.UnitStatus
+	FilteredServices []dbus.UnitStatus
+	CurrentPage      int
+	CurrentSelected  int
+	SearchQuery      string
+	ServiceAction    string
+	ErrorMessage     string
+	IsLoading        bool
+	DropdownOpen     bool
+	HighlightedItem  int
+	ServicesPerPage  int
+}
 
 func main() {
-	if err := ui.Init(); err != nil {
-		log.Fatalf("failed to initialize termui: %v", err)
-	}
-	defer ui.Close()
-
-	var err error
-	services, err = listServices()
-	if err != nil {
-		log.Fatalf("failed to list services: %v", err)
-	}
-	filteredServices = services
-
-	serviceTable := widgets.NewTable()
-	serviceTable.Rows = [][]string{{"Name", "Load", "Active", "Sub", "Description"}}
-	updateUI(serviceTable, filteredServices)
-
-	serviceTable.TextStyle = ui.NewStyle(ui.ColorWhite)
-	serviceTable.RowSeparator = true
-	serviceTable.BorderStyle = ui.NewStyle(ui.ColorGreen)
-
-	grid := ui.NewGrid()
-	grid.SetRect(0, 0, 100, 30)
-	grid.Set(ui.NewRow(1.0, serviceTable))
-
-	ui.Render(grid)
-
-	for e := range ui.PollEvents() {
-		switch e.ID {
-		case "<Down>":
-			maxIndex := min((currentPage+1)*servicesPerPage, len(filteredServices)) - currentPage*servicesPerPage - 1
-			currentSelected = (currentSelected + 1) % (maxIndex + 1)
-		case "<Up>":
-			maxIndex := min((currentPage+1)*servicesPerPage, len(filteredServices)) - currentPage*servicesPerPage - 1
-			currentSelected = (currentSelected - 1 + maxIndex + 1) % (maxIndex + 1)
-		case "<Right>", "l":
-			if (currentPage+1)*servicesPerPage < len(filteredServices) {
-				currentPage++
-				currentSelected = 0
-			}
-		case "<Left>", "h":
-			if currentPage > 0 {
-				currentPage--
-				currentSelected = 0
-			}
-		case "/":
-			searchQuery = prompt("Enter search query: ")
-			filterServices(serviceTable)
-		case "<Enter>":
-			if len(filteredServices) > 0 {
-				serviceIndex := currentPage*servicesPerPage + currentSelected
-				if serviceIndex < len(filteredServices) {
-					performAction(serviceTable, filteredServices[serviceIndex])
-				}
-			}
-		case "q", "<C-c>":
-			return
-		}
-
-		updateUI(serviceTable, filteredServices)
+	initialModel := NewModel()
+	p := tea.NewProgram(initialModel)
+	if err := p.Start(); err != nil {
+		log.Fatalf("Alas, there's been an error: %v", err)
 	}
 }
 
-func listServices() ([]dbus.UnitStatus, error) {
+func NewModel() Model {
+	return Model{
+		ServicesPerPage: 10,
+	}
+}
+
+func (m Model) Init() tea.Cmd {
 	conn, err := dbus.New()
 	if err != nil {
-		return nil, err
+		m.ErrorMessage = err.Error()
+		return nil
 	}
 	defer conn.Close()
 
 	units, err := conn.ListUnits()
 	if err != nil {
-		return nil, err
+		m.ErrorMessage = err.Error()
+		return nil
 	}
 
-	return units, nil
+	m.Services = units
+	m.FilteredServices = units
+	return nil
 }
 
-func updateUI(serviceTable *widgets.Table, services []dbus.UnitStatus) {
-	start := currentPage * servicesPerPage
-	end := start + servicesPerPage
-	if end > len(services) {
-		end = len(services)
-	}
-
-	visibleServices := services[start:end]
-
-	serviceTable.Rows = [][]string{{"Name", "Load", "Active", "Sub", "Description"}}
-	for i, service := range visibleServices {
-		row := []string{service.Name, service.LoadState, service.ActiveState, service.SubState, service.Description}
-		if i == currentSelected {
-			serviceTable.RowStyles[start+i+1] = ui.NewStyle(ui.ColorWhite, ui.ColorBlue, ui.ModifierBold)
-		} else {
-			serviceTable.RowStyles[start+i+1] = ui.NewStyle(ui.ColorWhite)
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q":
+			return m, tea.Quit
+		case "up":
+			if m.CurrentSelected > 0 {
+				m.CurrentSelected--
+			}
+		case "down":
+			if m.CurrentSelected < len(m.FilteredServices)-1 {
+				m.CurrentSelected++
+			}
+		case "enter":
+			if m.CurrentSelected >= 0 && m.CurrentSelected < len(m.FilteredServices) {
+				m.IsLoading = true
+				serviceName := m.FilteredServices[m.CurrentSelected].Name
+				switch m.ServiceAction {
+				case "start":
+					go func() {
+						err := startService(serviceName)
+						if err != nil {
+							m.ErrorMessage = err.Error()
+						} else {
+							m.ErrorMessage = ""
+						}
+						m.IsLoading = false
+					}()
+				case "stop":
+					go func() {
+						err := stopService(serviceName)
+						if err != nil {
+							m.ErrorMessage = err.Error()
+						} else {
+							m.ErrorMessage = ""
+						}
+						m.IsLoading = false
+					}()
+				case "restart":
+					go func() {
+						err := restartService(serviceName)
+						if err != nil {
+							m.ErrorMessage = err.Error()
+						} else {
+							m.ErrorMessage = ""
+						}
+						m.IsLoading = false
+					}()
+				}
+			}
+		case "s":
+			m.SearchQuery = ""
+			m.DropdownOpen = true
 		}
-		serviceTable.Rows = append(serviceTable.Rows, row)
 	}
-	ui.Render(serviceTable)
+
+	// Additional code for using restartAction
+	restartAction := ""
+	if m.ServiceAction == "restart" {
+		restartAction = " [ Restart]"
+	}
+
+	m.FilteredServices = filterServices(m.Services, m.SearchQuery)
+
+	return m, nil
 }
 
-func filterServices(serviceTable *widgets.Table) {
-	filteredServices = []dbus.UnitStatus{}
-	for _, service := range services {
-		if strings.Contains(strings.ToLower(service.Name), strings.ToLower(searchQuery)) {
-			filteredServices = append(filteredServices, service)
+func (m Model) View() string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("[Service Monitor]     [Actions]\n┌───────────────────┐  ┌────────────┐\n"))
+
+	startAction := ""
+	stopAction := ""
+	restartAction := ""
+	if m.ServiceAction == "start" {
+		startAction = " [ Start ]"
+	} else if m.ServiceAction == "stop" {
+		stopAction = " [ Stop  ]"
+	} else if m.ServiceAction == "restart" {
+		restartAction = " [ Restart]"
+	}
+
+	for i := 0; i < m.ServicesPerPage; i++ {
+		index := i + m.CurrentPage*m.ServicesPerPage
+		if index >= len(m.FilteredServices) {
+			break
 		}
+		service := m.FilteredServices[index]
+		selected := ""
+		if index == m.CurrentSelected {
+			selected = ">"
+		}
+		sb.WriteString(fmt.Sprintf("│ %s %-30s │  │  %s%s%s │\n", selected, service.Name, getServiceState(service), startAction, stopAction, restartAction))
+
 	}
-	currentPage = 0
-	currentSelected = 0 // Reset selection on new filter
-	updateUI(serviceTable, filteredServices)
+
+	sb.WriteString(fmt.Sprintf("│                   │  └────────────┘\n[Search]: %s [ Page %d / %d ]\n[Error]: %s\n", m.SearchQuery, m.CurrentPage+1, len(m.FilteredServices)/m.ServicesPerPage+1, m.ErrorMessage))
+	return sb.String()
 }
 
-func performAction(serviceTable *widgets.Table, service dbus.UnitStatus) {
+func startService(serviceName string) error {
 	conn, err := dbus.New()
 	if err != nil {
-		log.Printf("Error: %v", err)
-		return
+		return err
 	}
 	defer conn.Close()
 
-	action := prompt("Enter action (start/stop/restart/enable/disable): ")
-
-	var actionErr error
-	switch action {
-	case "start":
-		_, actionErr = conn.StartUnit(service.Name, "replace", nil)
-	case "stop":
-		_, actionErr = conn.StopUnit(service.Name, "replace", nil)
-	case "restart":
-		_, actionErr = conn.RestartUnit(service.Name, "replace", nil)
-	case "enable":
-		_, _, actionErr = conn.EnableUnitFiles([]string{service.Name}, false, true)
-	case "disable":
-		_, actionErr = conn.DisableUnitFiles([]string{service.Name}, false)
-	default:
-		fmt.Println("Invalid action")
-		return
-	}
-
-	if actionErr != nil {
-		log.Printf("Error performing action on service %s: %v", service.Name, err)
-	} else {
-		fmt.Printf("Action '%s' performed successfully on %s\n", action, service.Name)
-	}
-
-	refreshServices(serviceTable)
+	_, err = conn.StartUnit(serviceName, "replace", nil)
+	return err
 }
 
-func refreshServices(serviceTable *widgets.Table) {
-	var err error
-	services, err = listServices()
+func stopService(serviceName string) error {
+	conn, err := dbus.New()
 	if err != nil {
-		log.Printf("Error refreshing services: %v", err)
-		return
+		return err
 	}
-	filterServices(serviceTable)
+	defer conn.Close()
+
+	_, err = conn.StopUnit(serviceName, "replace", nil)
+	return err
 }
 
-func prompt(text string) string {
-	fmt.Print(text)
-	reader := bufio.NewReader(os.Stdin)
-	input, _ := reader.ReadString('\n')
-	return strings.TrimSpace(input)
+func restartService(serviceName string) error {
+	conn, err := dbus.New()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	_, err = conn.RestartUnit(serviceName, "replace", nil)
+	return err
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func filterServices(services []dbus.UnitStatus, query string) []dbus.UnitStatus {
+	if query == "" {
+		return services
 	}
-	return b
+
+	var filtered []dbus.UnitStatus
+	for _, service := range services {
+		if strings.Contains(service.Name, query) {
+			filtered = append(filtered, service)
+		}
+	}
+	return filtered
+}
+
+func getServiceState(service dbus.UnitStatus) string {
+	state := "Unknown"
+	switch service.ActiveState {
+	case "active":
+		state = "Running"
+	case "reloading":
+		state = "Reloading"
+	case "inactive":
+		state = "Stopped"
+	}
+	return state
 }
